@@ -1,0 +1,166 @@
+
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+#include <ggwave.h>
+
+// Pin configuration
+const int kPinLED0    = 2;
+const int kPinButton0 = 5;
+const int kPinSpeaker = 10;
+
+// Audio capture configuration
+const char channels        = 1;
+const int  sampleRate      = 6000;
+const int  samplesPerFrame = 128;
+
+// Audio capture ring-buffer
+const int qpow = 9;
+const int qmax = 1 << qpow;
+
+volatile int qhead = 0;
+volatile int qtail = 0;
+volatile int qsize = 0;
+
+int16_t sampleBuffer[qmax];
+
+// Error handling
+volatile int err = 0;
+
+// Global GGwave instance
+GGWave ggwave;
+
+void send_text(GGWave & ggwave, uint8_t pin, const char * text, GGWave::TxProtocolId protocolId) {
+    ggwave.init(text, protocolId);
+    ggwave.encode();
+
+    const auto & protocol = GGWave::Protocols::tx()[protocolId];
+    const auto tones = ggwave.txTones();
+    const auto duration_ms = protocol.txDuration_ms(ggwave.samplesPerFrame(), ggwave.sampleRateOut());
+    for (auto & curTone : tones) {
+        const auto freq_hz = (protocol.freqStart + curTone) * ggwave.hzPerSample();
+        tone(pin, freq_hz);
+        delay(duration_ms);
+    }
+
+    noTone(pin);
+    digitalWrite(pin, LOW);
+}
+Adafruit_ADS1115 ads;
+void setup() {
+    Serial.begin(57600);
+    while (!Serial);
+
+    pinMode(kPinLED0, OUTPUT);
+    pinMode(kPinSpeaker, OUTPUT);
+    pinMode(kPinButton0, INPUT_PULLUP);
+
+    digitalWrite(kPinLED0, LOW);
+
+    // Initialize the ADS1115
+    
+    ads.begin();
+
+    // Initialize "ggwave"
+    {
+        Serial.println(F("Trying to initialize the ggwave instance"));
+
+        ggwave.setLogFile(nullptr);
+
+        auto p = GGWave::getDefaultParameters();
+
+        p.payloadLength   = 16; // Make sure this matches the payload length used in transmission
+        p.sampleRateInp   = sampleRate;
+        p.sampleRateOut   = sampleRate;
+        p.sampleRate      = sampleRate;
+        p.samplesPerFrame = samplesPerFrame;
+        p.sampleFormatInp = GGWAVE_SAMPLE_FORMAT_I16;
+        p.sampleFormatOut = GGWAVE_SAMPLE_FORMAT_U8;
+        p.operatingMode   = GGWAVE_OPERATING_MODE_RX | GGWAVE_OPERATING_MODE_TX | GGWAVE_OPERATING_MODE_USE_DSS | GGWAVE_OPERATING_MODE_TX_ONLY_TONES;
+
+        // Protocols to use for TX
+        GGWave::Protocols::tx().disableAll();
+        GGWave::Protocols::tx().toggle(GGWAVE_PROTOCOL_MT_FASTEST, true);
+
+        // Protocols to use for RX
+        GGWave::Protocols::rx().disableAll();
+        GGWave::Protocols::rx().toggle(GGWAVE_PROTOCOL_MT_FASTEST, true);
+
+        ggwave.prepare(p, false);
+
+        Serial.print(F("Required memory by the ggwave instance: "));
+        Serial.print(ggwave.heapSize());
+        Serial.println(F(" bytes"));
+
+        ggwave.prepare(p, true);
+        Serial.print(F("Instance initialized successfully! Memory used: "));
+    }
+}
+
+void loop() {
+    int niter = 0;
+    int but0Prev = HIGH;
+
+    GGWave::TxRxData result;
+
+    char resultLast[17];
+    int tLastReceive = -10000;
+
+    // Read analog value from ADS1115
+    int16_t adcValue = ads.readADC_SingleEnded(0);
+
+    // Main loop
+    while (true) {
+        while (qsize >= samplesPerFrame) {
+            auto tStart = millis();
+
+            ggwave.decode(sampleBuffer + qhead, samplesPerFrame * sizeof(int16_t));
+            qsize -= samplesPerFrame;
+            qhead += samplesPerFrame;
+            if (qhead >= qmax) {
+                qhead = 0;
+            }
+
+            auto tEnd = millis();
+            if (++niter % 10 == 0) {
+                Serial.println(tEnd - tStart);
+                if (tEnd - tStart > 1000 * (float(samplesPerFrame) / sampleRate)) {
+                    Serial.println(F("Warning: decode() took too long to execute!"));
+                }
+            }
+
+            int nr = ggwave.rxTakeData(result);
+            if (nr > 0) {
+                Serial.println(tEnd - tStart);
+                Serial.print(F("Received data with length "));
+                Serial.print(nr);
+                Serial.println(F(" bytes:"));
+                Serial.println((char *)result.data());
+
+                strcpy(resultLast, (char *)result.data());
+                tLastReceive = tEnd;
+            }
+        }
+
+        if (err > 0) {
+            Serial.println(F("ERRROR"));
+            Serial.println(err);
+            err = 0;
+        }
+
+        int but0 = digitalRead(kPinButton0);
+        if (but0 == LOW && but0Prev == HIGH) {
+            Serial.println(F("Button 0 pressed - transmitting .."));
+
+            char resultLast[17];
+            snprintf(resultLast, sizeof(resultLast), "%d", adcValue);
+
+            send_text(ggwave, kPinSpeaker, resultLast, GGWAVE_PROTOCOL_MT_FASTEST);
+
+            but0Prev = LOW;
+            Serial.println(F("Done"));
+        } else if (but0 == HIGH && but0Prev == LOW) {
+            but0Prev = HIGH;
+        }
+    }
+
+}
